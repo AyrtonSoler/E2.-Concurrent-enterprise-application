@@ -11,6 +11,9 @@ defmodule TaxiBe.Application do
       TaxiBeWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:taxi_be, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: TaxiBe.PubSub},
+      # Supervisor dinamico que aloja un proceso por reserva, desacoplado del
+      # proceso del request HTTP que la crea.
+      {DynamicSupervisor, name: TaxiBe.BookingSupervisor, strategy: :one_for_one},
       # Start the Finch HTTP client for sending emails
       {Finch, name: TaxiBe.Finch},
       # Start a worker by calling: TaxiBe.Worker.start_link(arg)

@@ -2,14 +2,18 @@ defmodule TaxiBeWeb.BookingController do
   use TaxiBeWeb, :controller
   alias TaxiBeWeb.TaxiAllocationJob
 
-  # Crea una reserva: genera un id y arranca el proceso de asignacion.
+  # Crea una reserva: genera un id y arranca el proceso de asignacion bajo el
+  # supervisor dinamico (desacoplado del proceso del request HTTP).
   def create(conn, req) do
     booking_id = UUID.uuid1()
 
-    TaxiAllocationJob.start_link(
-      req |> Map.put("booking_id", booking_id),
-      String.to_atom(booking_id)
-    )
+    spec = %{
+      id: TaxiAllocationJob,
+      start: {TaxiAllocationJob, :start_link, [Map.put(req, "booking_id", booking_id), String.to_atom(booking_id)]},
+      restart: :temporary
+    }
+
+    DynamicSupervisor.start_child(TaxiBe.BookingSupervisor, spec)
 
     conn
     |> put_resp_header("Location", "/api/bookings/" <> booking_id)
