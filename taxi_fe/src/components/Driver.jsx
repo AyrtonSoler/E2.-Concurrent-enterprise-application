@@ -25,7 +25,11 @@ function Driver(props) {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({action: decision, username: props.username})
-    }).then(resp => setVisible(false));
+    }).then(resp => {
+      // Al rechazar ocultamos la tarjeta; al aceptar esperamos la respuesta
+      // del servidor (aceptado / ya fue tomado) que actualiza el mensaje.
+      if (decision === "reject") setVisible(false);
+    });
   };
 
   return (

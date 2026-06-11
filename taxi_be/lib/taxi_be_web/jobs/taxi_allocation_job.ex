@@ -1,20 +1,22 @@
 defmodule TaxiBeWeb.TaxiAllocationJob do
   @moduledoc """
-  Orquestador de la asignacion de un viaje (version SECUENCIAL).
+  Orquestador de la asignacion de un viaje (version PARALELA).
 
   Un GenServer por reserva. El proceso:
     1. Calcula la tarifa y la informa al cliente.
     2. Selecciona los taxis candidatos mas cercanos.
-    3. Contacta a UN conductor a la vez. Si rechaza o no responde dentro
-       del tiempo limite, contacta al siguiente candidato.
-    4. Si un conductor acepta, notifica al cliente con la informacion del taxi.
-    5. Si ningun conductor acepta, notifica al cliente que no fue posible
-       despachar un taxi.
+    3. Contacta a los TRES conductores SIMULTANEAMENTE y arma un unico
+       temporizador de 1.5 minutos para que respondan.
+    4. El primer conductor que acepta gana el viaje: se notifica al cliente
+       con la informacion del taxi y el tiempo estimado de llegada. Las
+       aceptaciones posteriores se descartan ("el viaje ya fue tomado").
+    5. Si nadie acepta dentro de 1.5 minutos (o todos rechazan antes), se
+       notifica al cliente que no fue posible despachar un taxi.
   """
   use GenServer
 
-  # Tiempo que se le da a cada conductor para responder (version secuencial)
-  @driver_timeout 30_000
+  # Tiempo total que se da a los conductores para responder: 1.5 min.
+  @booking_timeout 90_000
 
   # === API ===
 
@@ -27,10 +29,10 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
   @impl true
   def init(request) do
     Process.send(self(), :allocate, [:nosuspend])
-    {:ok, %{request: request, status: :init, timer: nil, contacted: nil}}
+    {:ok, %{request: request, status: :init, timer: nil, driver: nil, pending: MapSet.new()}}
   end
 
-  # Calcula la tarifa, la informa al cliente y comienza a contactar conductores.
+  # Calcula la tarifa, la informa al cliente y contacta a todos los conductores.
   @impl true
   def handle_info(:allocate, %{request: request} = state) do
     {_request, fare} = compute_ride_fare(request)
@@ -43,27 +45,52 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
       |> Map.put(:fare, fare)
       |> Map.put(:candidates, candidates)
 
-    {:noreply, contact_next_driver(state)}
+    {:noreply, contact_all_drivers(state)}
   end
 
-  # El conductor contactado no respondio a tiempo: pasar al siguiente.
+  # Paso el tiempo limite (1.5 min) sin que ningun conductor aceptara.
   @impl true
-  def handle_info(:driver_timeout, state) do
-    {:noreply, contact_next_driver(%{state | timer: nil})}
+  def handle_info(:timeout, %{status: :contacting, request: request} = state) do
+    notify_no_taxi(request)
+    {:noreply, %{state | status: :failed, timer: nil}}
   end
 
-  # El conductor acepto el viaje.
+  # El temporizador llego tarde (el viaje ya se resolvio): ignorar.
+  def handle_info(:timeout, state) do
+    {:noreply, state}
+  end
+
+  # Primer conductor en aceptar: gana el viaje.
   @impl true
-  def handle_cast({:process_accept, driver_username}, %{request: request} = state) do
+  def handle_cast({:process_accept, driver_username}, %{status: :contacting, request: request} = state) do
     cancel_timer(state.timer)
+    notify_driver_accepted(driver_username)
     notify_customer_accept(request, driver_username)
     {:noreply, %{state | status: :accepted, timer: nil, driver: driver_username}}
   end
 
-  # El conductor rechazo el viaje: contactar al siguiente candidato.
+  # Aceptacion tardia: el viaje ya fue tomado por otro conductor.
+  def handle_cast({:process_accept, driver_username}, state) do
+    notify_driver_taken(driver_username)
+    {:noreply, state}
+  end
+
+  # Un conductor rechaza. Si todos los contactados rechazaron, fallar de inmediato.
+  def handle_cast({:process_reject, driver_username}, %{status: :contacting} = state) do
+    pending = MapSet.delete(state.pending, driver_username)
+
+    if MapSet.size(pending) == 0 do
+      cancel_timer(state.timer)
+      notify_no_taxi(state.request)
+      {:noreply, %{state | pending: pending, status: :failed, timer: nil}}
+    else
+      {:noreply, %{state | pending: pending}}
+    end
+  end
+
+  # Rechazo cuando el viaje ya se resolvio: ignorar.
   def handle_cast({:process_reject, _driver_username}, state) do
-    cancel_timer(state.timer)
-    {:noreply, contact_next_driver(%{state | timer: nil})}
+    {:noreply, state}
   end
 
   # El cliente cancela el viaje (la politica de cargos se agrega en la Parte 3).
@@ -75,17 +102,14 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
 
   # === Logica de asignacion ===
 
-  # Sin mas candidatos: avisar al cliente que no hay taxi disponible.
-  defp contact_next_driver(%{candidates: [], request: request} = state) do
-    notify_no_taxi(request)
-    %{state | status: :failed, contacted: nil, timer: nil}
-  end
+  # Contacta a TODOS los candidatos a la vez y arma un unico temporizador.
+  defp contact_all_drivers(%{candidates: candidates, request: request} = state) do
+    Enum.each(candidates, fn taxi -> forward_request_to_driver(request, taxi) end)
 
-  # Contactar al siguiente candidato y armar el temporizador de respuesta.
-  defp contact_next_driver(%{candidates: [taxi | rest], request: request} = state) do
-    forward_request_to_driver(request, taxi)
-    timer = Process.send_after(self(), :driver_timeout, @driver_timeout)
-    %{state | candidates: rest, contacted: taxi, timer: timer, status: :contacting}
+    pending = candidates |> Enum.map(& &1.nickname) |> MapSet.new()
+    timer = Process.send_after(self(), :timeout, @booking_timeout)
+
+    %{state | pending: pending, timer: timer, status: :contacting}
   end
 
   defp cancel_timer(nil), do: :ok
@@ -115,6 +139,22 @@ defmodule TaxiBeWeb.TaxiAllocationJob do
       "customer:" <> customer,
       "booking_request",
       %{msg: "El conductor #{driver_username} acepto tu viaje y llegara en 5 min"}
+    )
+  end
+
+  defp notify_driver_accepted(driver_username) do
+    TaxiBeWeb.Endpoint.broadcast(
+      "driver:" <> driver_username,
+      "booking_request",
+      %{msg: "Has aceptado el viaje. Dirigete al punto de encuentro"}
+    )
+  end
+
+  defp notify_driver_taken(driver_username) do
+    TaxiBeWeb.Endpoint.broadcast(
+      "driver:" <> driver_username,
+      "booking_request",
+      %{msg: "El viaje ya fue tomado por otro conductor"}
     )
   end
 
